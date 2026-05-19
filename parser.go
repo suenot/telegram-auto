@@ -13,6 +13,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -20,6 +21,48 @@ import (
 	shared "github.com/suenot/w-popularity-shared"
 	"golang.org/x/net/html"
 )
+
+// extractGroupCard parses members/online + og:title/og:description from a
+// plain t.me/<handle> page (groups + restricted channels). Numbers may be
+// formatted with NBSP / regular spaces, e.g. "1 377 members, 428 online".
+var (
+	pageExtraRE  = regexp.MustCompile(`(?s)tgme_page_extra[^>]*>([^<]+)<`)
+	membersRE    = regexp.MustCompile(`([\d \xa0,]+)\s*(?:members|subscribers|подписч|участн)`) // "1 377 members" / "1,377 subscribers" / Russian
+	onlineRE     = regexp.MustCompile(`([\d \xa0,]+)\s*online`)
+	ogTitleRE    = regexp.MustCompile(`<meta property="og:title" content="([^"]*)"`)
+	ogDescRE     = regexp.MustCompile(`<meta property="og:description" content="([^"]*)"`)
+)
+
+func extractGroupCard(body []byte) (members, online int64, title, desc string) {
+	s := string(body)
+	if m := pageExtraRE.FindStringSubmatch(s); len(m) > 1 {
+		card := m[1]
+		if mm := membersRE.FindStringSubmatch(card); len(mm) > 1 {
+			members = parseSpacedInt(mm[1])
+		}
+		if om := onlineRE.FindStringSubmatch(card); len(om) > 1 {
+			online = parseSpacedInt(om[1])
+		}
+	}
+	if t := ogTitleRE.FindStringSubmatch(s); len(t) > 1 {
+		title = strings.TrimSpace(t[1])
+	}
+	if d := ogDescRE.FindStringSubmatch(s); len(d) > 1 {
+		desc = strings.TrimSpace(d[1])
+	}
+	return
+}
+
+func parseSpacedInt(s string) int64 {
+	clean := strings.Map(func(r rune) rune {
+		if r >= '0' && r <= '9' {
+			return r
+		}
+		return -1
+	}, s)
+	n, _ := strconv.ParseInt(clean, 10, 64)
+	return n
+}
 
 // Config controls runtime behaviour.
 type Config struct {
@@ -61,15 +104,24 @@ type TelegramParser struct{ cfg Config }
 // Platform implements shared.Parser.
 func (p *TelegramParser) Platform() shared.Platform { return shared.PlatformTelegram }
 
-// FetchChannel returns a snapshot for the given public channel handle.
-// Users (and private/missing channels) return shared.ErrNotFound.
+// FetchChannel returns a snapshot for the given public channel or group.
+// Channels expose subscribers + posts via the /s/ preview; groups expose only
+// member count via the plain t.me/<handle> page. Private/missing entries
+// return shared.ErrNotFound.
 func (p *TelegramParser) FetchChannel(ctx context.Context, handle string) (shared.ChannelSnapshot, error) {
 	doc, finalURL, err := p.fetchPreview(ctx, handle)
 	if err != nil {
 		return shared.ChannelSnapshot{}, err
 	}
 	if !hasPreviewMarker(doc) {
-		return shared.ChannelSnapshot{}, fmt.Errorf("%w: %q is not a public channel (no t.me/s preview at %s)", shared.ErrNotFound, handle, finalURL)
+		// No /s/ preview — try the plain /<handle> page; it's a group or a
+		// chat-style channel without exposed posts feed. Extract member
+		// count from `tgme_page_extra`.
+		gsnap, gerr := p.fetchGroupCard(ctx, handle)
+		if gerr == nil {
+			return gsnap, nil
+		}
+		return shared.ChannelSnapshot{}, fmt.Errorf("%w: %q is not a public channel or group (no preview at %s)", shared.ErrNotFound, handle, finalURL)
 	}
 
 	counters := extractCounters(doc)
@@ -81,7 +133,7 @@ func (p *TelegramParser) FetchChannel(ctx context.Context, handle string) (share
 		URL:       fmt.Sprintf("https://t.me/%s", handle),
 		FetchedAt: time.Now().UTC(),
 		Followers: counters["subscribers"],
-		Raw:       map[string]interface{}{},
+		Raw:       map[string]interface{}{"kind": "channel"},
 	}
 	// Posts count is rarely surfaced directly. Approximate as sum of media counters.
 	if pc, ok := counters["posts"]; ok {
@@ -96,6 +148,54 @@ func (p *TelegramParser) FetchChannel(ctx context.Context, handle string) (share
 		snap.Raw[k] = v
 	}
 	return snap, nil
+}
+
+// fetchGroupCard handles the case where /s/<handle> redirects away (groups
+// and some restricted channels don't expose a posts preview). It scrapes
+// t.me/<handle> for `tgme_page_extra` ("123 members, 45 online") and
+// `og:title` / `og:description`.
+func (p *TelegramParser) fetchGroupCard(ctx context.Context, handle string) (shared.ChannelSnapshot, error) {
+	u := fmt.Sprintf("%s/%s", strings.TrimRight(p.cfg.BaseURL, "/"), url.PathEscape(handle))
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
+	if err != nil {
+		return shared.ChannelSnapshot{}, fmt.Errorf("%w: build request: %v", shared.ErrTransient, err)
+	}
+	req.Header.Set("User-Agent", p.cfg.UserAgent)
+	req.Header.Set("Accept", "text/html,application/xhtml+xml")
+	resp, err := p.cfg.HTTPClient.Do(req)
+	if err != nil {
+		return shared.ChannelSnapshot{}, fmt.Errorf("%w: %v", shared.ErrTransient, err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		return shared.ChannelSnapshot{}, fmt.Errorf("%w: http %d", shared.ErrNotFound, resp.StatusCode)
+	}
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 2*1024*1024))
+	if err != nil {
+		return shared.ChannelSnapshot{}, fmt.Errorf("%w: read: %v", shared.ErrTransient, err)
+	}
+	members, online, title, desc := extractGroupCard(body)
+	if members == 0 && title == "" {
+		return shared.ChannelSnapshot{}, fmt.Errorf("%w: no tgme_page_extra found", shared.ErrNotFound)
+	}
+	raw := map[string]interface{}{"kind": "group"}
+	if title != "" {
+		raw["title"] = title
+	}
+	if desc != "" {
+		raw["description"] = desc
+	}
+	if online > 0 {
+		raw["online"] = online
+	}
+	return shared.ChannelSnapshot{
+		Platform:  shared.PlatformTelegram,
+		Handle:    handle,
+		URL:       fmt.Sprintf("https://t.me/%s", handle),
+		FetchedAt: time.Now().UTC(),
+		Followers: members,
+		Raw:       raw,
+	}, nil
 }
 
 // FetchRecentPosts parses the embedded posts in the /s/ preview.

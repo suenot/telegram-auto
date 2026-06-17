@@ -1,4 +1,4 @@
-# w-popularity-parser-telegram
+# telegram-auto
 
 `telegram` parser for [w_popularity](https://github.com/suenot/w-popularity).
 
@@ -25,7 +25,7 @@ counters and the last ~20 posts inline.
 ## Usage
 
 ```go
-import parser "github.com/suenot/w-popularity-parser-telegram"
+import parser "github.com/suenot/telegram-auto"
 
 p := parser.New(parser.Config{HTTPTimeout: 15 * time.Second})
 snap, err := p.FetchChannel(ctx, "durov")

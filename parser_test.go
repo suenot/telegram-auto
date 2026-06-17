@@ -9,7 +9,7 @@ import (
 	"testing"
 	"time"
 
-	shared "github.com/suenot/w-popularity-shared"
+	shared "github.com/suenot/socials-auto"
 )
 
 // fakeChannelHTML mimics the minimum structure t.me/s/<handle> emits for

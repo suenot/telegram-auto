@@ -1,8 +1,8 @@
-module github.com/suenot/w-popularity-parser-telegram
+module github.com/suenot/telegram-auto
 
 go 1.25.0
 
 require (
-	github.com/suenot/w-popularity-shared v0.0.0-20260518102401-d17456f924be
+	github.com/suenot/socials-auto v0.0.0-20260617143605-3f3b401c45a1
 	golang.org/x/net v0.54.0
 )
